@@ -1,0 +1,8 @@
+./frontend/node_modules
+./backend/auth-service/venv
+./backend/email-service/venv
+./backend/payment-service/venv
+./backend/profile-service/venv
+./backend/tuition-service/venv
+./backend/otp-service/venv
+./backend/email-service/token.json

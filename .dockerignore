@@ -1,0 +1,6 @@
+./backend/auth-service/venv
+./backend/profile-service/venv
+./backend/tuition-service/venv
+./backend/payment-service/venv
+./backend/email-service/venv
+./frontend/node_modules
