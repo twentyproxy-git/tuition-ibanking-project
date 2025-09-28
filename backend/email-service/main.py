@@ -6,8 +6,8 @@ import redis
 import random
 
 # Self-defined modules
-from send_email import send_otp_email
-from models import EmailRequest
+from send_email import send_otp_email, send_transaction_email
+from models import OTPEmailRequest, TransactionEmailRequest
 
 PROFILE_SERVICE_URL = "http://profile-service:8002"
 OTP_SERVICE_URL = "http://otp-service:8006"
@@ -26,7 +26,7 @@ def root():
     return JSONResponse(content=data, status_code=200)
 
 @router.post("/send-otp")
-def sendOTP(input: EmailRequest = Body(...)) -> dict:
+def sendOTP(input: OTPEmailRequest = Body(...)) -> dict:
     resp = requests.get(f"{PROFILE_SERVICE_URL}/profile/get-by-email/{input.email}")
     if resp.status_code != 200:
         raise HTTPException(status_code=404, detail="Email not found in profiles")
@@ -38,5 +38,19 @@ def sendOTP(input: EmailRequest = Body(...)) -> dict:
         return JSONResponse(content=data, status_code=200)
     else:
         raise HTTPException(status_code=500, detail="Failed to send OTP email")
+
+@router.post("/send-transaction")
+def sendTransactionEmail(input: TransactionEmailRequest = Body(...)) -> dict:
+    resp = requests.get(f"{PROFILE_SERVICE_URL}/profile/get-by-email/{input.email}")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=404, detail="Email not found in profiles")
+    user_id = resp.json().get("user_id")
+
+    from send_email import send_transaction_email
+    if send_transaction_email(input.email, resp.json().get("full_name"), input.debit, input.content):
+        data = {"message": f"Transaction email sent to {input.email}"}
+        return JSONResponse(content=data, status_code=200)
+    else:
+        raise HTTPException(status_code=500, detail="Failed to send transaction email")
 
 app.include_router(router)

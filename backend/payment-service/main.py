@@ -33,7 +33,7 @@ def startup_event():
 def root():
     return {"message": "Hello from payment"}
 
-@router.get("/all")
+@router.get("/balance/all")
 def getBalanceByUserID() -> list[dict]:
     balances = []
     for balance in balance_collection.find():
@@ -49,7 +49,26 @@ def getBalanceByUserID() -> list[dict]:
             })
     return JSONResponse(content=balances, status_code=200)
 
-@router.get('/get-transactions')
+@router.get("/balance/get-balance")
+async def getBalanceById(authorization: str = Header(...)) -> dict: 
+    # Authenticate user
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid auth header")
+    token = authorization.split(" ")[1]
+    payload = verify_jwt(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token") 
+    user_id = payload["user_id"]
+
+    # Retrieve balance from MongoDB
+    balance_doc = balance_collection.find_one({"user_id": ObjectId(user_id)})
+    if not balance_doc:
+        raise HTTPException(status_code=404, detail="Balance not found")
+    balance = balance_doc.get("amount", 0)
+
+    return JSONResponse(content={"balance": balance}, status_code=200)
+
+@router.get('/transaction/get-transaction')
 async def getTransactionsById(authorization: str = Header(...)) -> list[dict]: 
     # Authenticate user
     if not authorization.startswith("Bearer "):
@@ -79,7 +98,7 @@ async def getTransactionsById(authorization: str = Header(...)) -> list[dict]:
         raise HTTPException(status_code=404, detail="Transaction history not found")
     return JSONResponse(content=transactions, status_code=200)
 
-@router.post("/request-payment")
+@router.post("/transaction/request-payment")
 async def requestPayment(authorization: str = Header(...), input: TuitionRequest = Body(...)):
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid auth header")
@@ -115,16 +134,20 @@ async def requestPayment(authorization: str = Header(...), input: TuitionRequest
         email = profile.get("email")
         if not email:
             raise HTTPException(status_code=404, detail="Email not found")
-        
+
         # -- Generate OTP --
         otp_service_resp = requests.post(f"{OTP_SERVICE_URL}/otp/issue-otp", json={"user_id": user_id})
         if otp_service_resp.status_code != 200:
             raise HTTPException(status_code=500, detail="Failed to generate OTP")
-        
+
         otp_data = otp_service_resp.json()
         otp = otp_data.get("otp")
         if not otp:
             raise HTTPException(status_code=500, detail="OTP not found in Redis")
+
+        # -- Save mssv to Redis for verification step --
+        mssv_key = f"mssv:{user_id}"
+        redis_client.set(mssv_key, input.mssv, ex=300)  # 5 phút
 
         # -- Send OTP via Email --
         email_payload = {"email": email, "otp": otp}
@@ -141,7 +164,7 @@ async def requestPayment(authorization: str = Header(...), input: TuitionRequest
     else:
         raise HTTPException(status_code=400, detail="Insufficient balance")
 
-@router.post("/verify-payment")
+@router.post("/transaction/verify-payment")
 async def verifyPayment(authorization: str = Header(...), input: PaymentRequest = Body(...)):
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid auth header")
@@ -164,6 +187,14 @@ async def verifyPayment(authorization: str = Header(...), input: PaymentRequest 
         if stored_otp != input.otp:
             raise HTTPException(status_code=400, detail="Invalid OTP")
 
+        # -- Check mssv matches the one used in request-payment --
+        mssv_key = f"mssv:{user_id}"
+        stored_mssv = redis_client.get(mssv_key)
+        if not stored_mssv:
+            raise HTTPException(status_code=400, detail="MSSV expired or not found. Please request payment again.")
+        if stored_mssv != input.mssv:
+            raise HTTPException(status_code=400, detail=f"MSSV does not match. Please use the same MSSV as in request-payment. MSSV requested: {stored_mssv}, MSSV provided: {input.mssv}")
+
         balance_doc = balance_collection.find_one({"user_id": ObjectId(user_id)})
         if not balance_doc:
             raise HTTPException(status_code=404, detail="Balance not found")
@@ -173,6 +204,11 @@ async def verifyPayment(authorization: str = Header(...), input: PaymentRequest 
         if tuition_resp.status_code != 200:
             raise HTTPException(status_code=404, detail="Tuition not found")
         tuition_doc = tuition_resp.json()
+
+        profile_resp = requests.get(f"{PROFILE_SERVICE_URL}/profile/get-by-user/{user_id}")
+        if profile_resp.status_code != 200:
+            raise HTTPException(status_code=404, detail="Email not found")
+        profile = profile_resp.json()
 
         # Proceed with payment
         fee = int(tuition_doc.get("amount", 0))
@@ -198,6 +234,12 @@ async def verifyPayment(authorization: str = Header(...), input: PaymentRequest 
             "user_id": ObjectId(user_id)
         })
 
+        # -- Send OTP via Email --
+        email_payload = {"email": profile.get("email"), "full_name": profile.get("full_name"), "debit": str(fee), "content": f"Payment for tuition of Student ID {input.mssv}"}
+        email_service_resp = requests.post(f"{EMAIL_SERVICE_URL}/email/send-transaction", json=email_payload)
+        if email_service_resp.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to send transaction email")
+
         redis_client.delete(otp_key)
 
         data = {
@@ -205,6 +247,7 @@ async def verifyPayment(authorization: str = Header(...), input: PaymentRequest 
             "message": f"Payment for {input.mssv} successful",
             "remaining_balance": new_balance
         }
+
         return JSONResponse(content=data, status_code=200)
     finally:
         redis_client.delete(lock_key)

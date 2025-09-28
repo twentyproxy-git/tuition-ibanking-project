@@ -9,6 +9,7 @@ from googleapiclient.errors import HttpError
 from email.message import EmailMessage
 from email.utils import formataddr
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send',
           'https://www.googleapis.com/auth/gmail.compose']
@@ -57,9 +58,23 @@ def send_email_v1(recipient, subject, html_content):
 
 def send_otp_email(recipient: str, otp: str, full_name: str):
     subject = "OTP Code for Payment Verification"
-    html_template = load_template("template.html", {
+    html_template = load_template("otp_template.html", {
         "name": full_name,
         "otp": otp
+    })
+    return send_email_v1(recipient, subject, html_template)
+
+def send_transaction_email(recipient: str, full_name: str, debit: str, content: str):
+    subject = "Transaction Notification"
+    vn_timezone = ZoneInfo("Asia/Ho_Chi_Minh")
+    curr_time = datetime.now(vn_timezone).strftime("%Y-%m-%d %H:%M:%S")
+    debit_value = int(debit)
+    debit_str = "{:,.0f}".format(debit_value).replace(",", ".")
+    html_template = load_template("transaction_template.html", {
+        "name": full_name,
+        "debit": debit_str,
+        "content": content,
+        "time": curr_time
     })
     return send_email_v1(recipient, subject, html_template)
 
