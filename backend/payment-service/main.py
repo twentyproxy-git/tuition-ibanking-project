@@ -98,8 +98,9 @@ async def getTransactionsById(authorization: str = Header(...)) -> list[dict]:
         raise HTTPException(status_code=404, detail="Transaction history not found")
     return JSONResponse(content=transactions, status_code=200)
 
+# Latest Modified from here to verify-payment: Adđ "idempotency_key" to avoid payment conflict
 @router.post("/transaction/request-payment")
-async def requestPayment(authorization: str = Header(...), input: TuitionRequest = Body(...)):
+async def requestPayment(authorization: str = Header(...), idempotency_key: str = Header(...), input: TuitionRequest = Body(...)):
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid auth header")
     token = authorization.split(" ")[1]
@@ -108,6 +109,15 @@ async def requestPayment(authorization: str = Header(...), input: TuitionRequest
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     user_id = payload["user_id"]
 
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="Idempotency key is required")
+    
+    if redis_client.get(f"idempotency:{idempotency_key}"):
+        raise HTTPException(status_code=409, detail="Duplicate request")
+
+    redis_client.set(f"idempotency:{idempotency_key}", "1", ex=300)
+
+    # -- Check balance and tuition fee --
     balance_doc = balance_collection.find_one({"user_id": ObjectId(user_id)})
     if not balance_doc:
         raise HTTPException(status_code=404, detail="Balance not found")
@@ -165,7 +175,7 @@ async def requestPayment(authorization: str = Header(...), input: TuitionRequest
         raise HTTPException(status_code=400, detail="Insufficient balance")
 
 @router.post("/transaction/verify-payment")
-async def verifyPayment(authorization: str = Header(...), input: PaymentRequest = Body(...)):
+async def verifyPayment(authorization: str = Header(...), idempotency_key: str = Header(...), input: PaymentRequest = Body(...)):
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid auth header")
     token = authorization.split(" ")[1]
@@ -174,10 +184,13 @@ async def verifyPayment(authorization: str = Header(...), input: PaymentRequest 
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     user_id = payload["user_id"]
 
-    lock_key = f"lock:payment:{user_id}"
-    got_lock = redis_client.set(lock_key, "1", nx=True, ex=10)
-    if not got_lock:
-        raise HTTPException(status_code=429, detail="Payment already in progress, please try again later")
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="Idempotency key is required")
+
+    if redis_client.get(f"idempotency:verify:{idempotency_key}"):
+        raise HTTPException(status_code=409, detail="Duplicate verify request")
+
+    redis_client.set(f"idempotency:verify:{idempotency_key}", "1", ex=10)
 
     try:
         otp_key = f"otp:{user_id}"
@@ -187,7 +200,6 @@ async def verifyPayment(authorization: str = Header(...), input: PaymentRequest 
         if stored_otp != input.otp:
             raise HTTPException(status_code=400, detail="Invalid OTP")
 
-        # -- Check mssv matches the one used in request-payment --
         mssv_key = f"mssv:{user_id}"
         stored_mssv = redis_client.get(mssv_key)
         if not stored_mssv:
@@ -210,7 +222,6 @@ async def verifyPayment(authorization: str = Header(...), input: PaymentRequest 
             raise HTTPException(status_code=404, detail="Email not found")
         profile = profile_resp.json()
 
-        # Proceed with payment
         fee = int(tuition_doc.get("amount", 0))
         if balance < fee:
             raise HTTPException(status_code=400, detail="Insufficient balance")
@@ -221,7 +232,10 @@ async def verifyPayment(authorization: str = Header(...), input: PaymentRequest 
             {"$set": {"amount": new_balance}}
         )
 
-        tuition_resp = requests.post(f"{TUITION_SERVICE_URL}/tuition/update-status", json={"tuition_id": str(tuition_doc.get("_id")), "status": "paid"})
+        tuition_resp = requests.post(f"{TUITION_SERVICE_URL}/tuition/update-status", json={
+            "tuition_id": str(tuition_doc.get("_id")),
+            "status": "paid"
+        })
         if tuition_resp.status_code != 200:
             raise HTTPException(status_code=500, detail="Failed to update tuition status")
 
@@ -234,8 +248,13 @@ async def verifyPayment(authorization: str = Header(...), input: PaymentRequest 
             "user_id": ObjectId(user_id)
         })
 
-        # -- Send OTP via Email --
-        email_payload = {"email": profile.get("email"), "full_name": profile.get("full_name"), "debit": str(fee), "content": f"Payment for tuition of Student ID {input.mssv}"}
+        # -- Send transaction email --
+        email_payload = {
+            "email": profile.get("email"),
+            "full_name": profile.get("full_name"),
+            "debit": str(fee),
+            "content": f"Payment for tuition of Student ID {input.mssv}"
+        }
         email_service_resp = requests.post(f"{EMAIL_SERVICE_URL}/email/send-transaction", json=email_payload)
         if email_service_resp.status_code != 200:
             raise HTTPException(status_code=500, detail="Failed to send transaction email")
@@ -249,7 +268,9 @@ async def verifyPayment(authorization: str = Header(...), input: PaymentRequest 
         }
 
         return JSONResponse(content=data, status_code=200)
-    finally:
-        redis_client.delete(lock_key)
+
+    except Exception as e:
+        redis_client.delete(f"idempotency:verify:{idempotency_key}")
+        raise e
 
 app.include_router(router)
